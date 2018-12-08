@@ -15,6 +15,9 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+	fmt.Println(contents)
+	var kvs []mapreduce.KeyValue
+	return kvs
 }
 
 //
@@ -24,6 +27,8 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+	ret := "dummy"
+	return ret
 }
 
 // Can be run in 3 ways:
