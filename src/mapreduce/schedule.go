@@ -2,16 +2,41 @@ package mapreduce
 
 import (
 	"fmt"
-	"sync"
-	"time"
 )
 
-// track whether workers executed in parallel.
-type TaskStatus struct {
-	mu  sync.Mutex
-	status []int	// 0: not issued 1: being handled 2: succeded
-	phase jobPhase
-	finishedTask int
+type Result struct {
+	worker string
+	status bool
+	work int
+}
+
+func findUnfinishedWork(workStatus *[]int) int {
+	for index, val := range (*workStatus) {
+		if val == 0 {
+			return index
+		}
+	}
+	return -1
+}
+
+func dispatchTask(jobName string, mapFiles []string, currentTask int, address string, n_other int, phase jobPhase, success chan Result, fail chan Result) {
+	taskArgs := DoTaskArgs{jobName, "", phase, 0, n_other}
+	taskResult := Result{address, true, currentTask}
+
+	taskArgs.TaskNumber = currentTask		
+	if phase == mapPhase {
+		taskArgs.File = mapFiles[taskArgs.TaskNumber]
+	}
+	
+	status := call(address, "Worker.DoTask", taskArgs, nil)
+	
+	if status {		
+		taskResult.status = true
+		success <- taskResult
+	} else {		
+		taskResult.status = false
+		fail <- taskResult
+	}
 }
 
 //
@@ -43,105 +68,57 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 	
-	var taskStatus TaskStatus
-	taskStatus.status = make([]int, ntasks)
-	taskStatus.phase = phase
+	workers := make([]string, 0, 10)
+	workStatus := make([]int, ntasks)
+	finishedTasks := 0
 	
-	quit := make(chan int)
+	success := make(chan Result)
+        fail := make(chan Result)
 	
-	var waitGroup sync.WaitGroup 
+	defer close(success)
+	defer close(fail)
 	
-	go func() {
-		for {
-			select {
-			case registerStr := <- registerChan:
-				go dispatchTask(jobName, mapFiles, &taskStatus, registerStr, n_other, quit, &waitGroup)
-			case <- quit:
-				return
-			}
-		}
-	}()
-	
+	handleLoop:
 	for {
-		//Sleep to before waiting
-		time.Sleep(100 * time.Millisecond)
-		waitGroup.Wait()
-		
-		if taskStatus.finishedTask == ntasks {
-			quit <- 1
-			fmt.Println("All task finished. Stop listening")
-			break
-		} else {
-			fmt.Println("Task unfinihsed because lost of connection. Waiting for connecting again")
-		}
-	}
-
-	
-	time.Sleep(100 * time.Millisecond)
-}
-
-func dispatchTask(jobName string, mapFiles []string, taskStatus *TaskStatus, address string, n_other int, quit chan int, waitGroup *sync.WaitGroup) {
-	(*waitGroup).Add(1)
-	defer (*waitGroup).Done()
-	
-	taskArgs := DoTaskArgs{jobName, "", (*taskStatus).phase, 0, n_other}
-	
-	goodConnection := true
-	hasUnfinishedTask := true
-
-	for goodConnection && hasUnfinishedTask {	
-		currentTask := -1
-
-		//Find the next unfinishsed task
-		(*taskStatus).mu.Lock()
-		hasUnfinishedTask = false
-		for index, st := range (*taskStatus).status {
-			if st == 1 {										
-				hasUnfinishedTask = true
-			} else if st == 0 {
-				hasUnfinishedTask = true
-				currentTask = index
-				break
-			}
-		} 
-		
-		// Set the current task to in progress
-		if currentTask != -1 {
-			(*taskStatus).status[currentTask] = 1
-		}
-
-		(*taskStatus).mu.Unlock()
-		
-		// If no availble task but some are still unfinihsed, we sleep and wait for the next round
-		if currentTask == -1 && hasUnfinishedTask {
-			time.Sleep(100 * time.Millisecond)			
-			continue
-		} else if hasUnfinishedTask {
-			taskArgs.TaskNumber = currentTask		
-			if (*taskStatus).phase == mapPhase {
-				taskArgs.File = mapFiles[taskArgs.TaskNumber]
-			}
+		select {
+			case registerStr := <- registerChan:
+				fmt.Printf("Register worker %s\n", registerStr)
+				work := findUnfinishedWork(&workStatus)
+				if work == -1 {
+					workers = append(workers, registerStr)
+				} else {
+					workStatus[work] = 1
+					go dispatchTask(jobName, mapFiles, work, registerStr, n_other, phase, success, fail)	
+				}					
+			case taskReturn := <- success:
+				workStatus[taskReturn.work] = 2
 				
-			goodConnection = call(address, "Worker.DoTask", taskArgs, nil)
-			
-			(*taskStatus).mu.Lock()
+				finishedTasks++
+				
+				if finishedTasks == ntasks {
+					fmt.Println("All tasks finished!")	
+					break handleLoop
+				} else
+				{
+					work := findUnfinishedWork(&workStatus)
+					if work == -1 {
+						workers = append(workers, taskReturn.worker)
+					} else {
+						workStatus[work] = 1
+						go dispatchTask(jobName, mapFiles, work, taskReturn.worker, n_other, phase, success, fail)	
+					}
+				}
+			case taskReturn := <- fail:
+				workStatus[taskReturn.work] = 0
 
-			if goodConnection {
-				(*taskStatus).status[currentTask] = 2
-				(*taskStatus).finishedTask++
-			} else {		
-				(*taskStatus).status[currentTask] = 0
-			}
-			
-			(*taskStatus).mu.Unlock()
+				if len(workers) == 0 {
+					fmt.Println("No available workers!")
+				} else	{
+					workStatus[taskReturn.work] = 1
+					worker := workers[len(workers) - 1]
+					workers = workers[:len(workers) - 1]
+					go dispatchTask(jobName, mapFiles, taskReturn.work, worker, n_other, phase, success, fail)
+				}
 		}
 	}
-
-	if !goodConnection {
-		fmt.Printf("%s: Return because connection stopped!\n", address)
-	} else {
-		fmt.Printf("%s: Return because all tasks finish\n", address)
-	}
 }
-
-
